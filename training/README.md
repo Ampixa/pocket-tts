@@ -41,7 +41,8 @@ Now in detail:
 ## Installation
 
 Requirements:
-- Linux - we don't provide official support for Windows/Mac training, as we don't have the hardware or time to support those platforms.
+- Linux upstream. This fork adds single-device training on Apple Silicon via the MPS
+  backend, see [Training on Apple Silicon](#training-on-apple-silicon).
 - One NVIDIA GPU (the default batch size wants ~56 GB; a consumer GPU runs `batch_size: 16` with
   `grad_accum_steps: 4` in ~16 GB); you can use more GPUs to train faster
 - Python 3.10+ and [uv](https://docs.astral.sh/uv/)
@@ -80,6 +81,43 @@ explicit = true
 Then `uv sync` picks up the pin like any other dependency change — no separate
 reinstall step, and it survives future `uv sync`/`uv lock` runs.
 </details>
+
+### Training on Apple Silicon
+
+Single-device training runs on the MPS backend, no CUDA required. Upstream
+does not support it (kyutai-labs/pocket-tts#255 by @michaldobiezynski was
+closed as out of scope); this fork carries that PR's work plus what was needed
+on older macOS and shared machines.
+
+```bash
+uv run training/train.py training/configs/scratch_mps.yaml
+```
+
+What the branch changes, and why:
+
+- `distributed.py` accepts MPS; `POCKET_TTS_DEVICE=cuda|mps|cpu` forces a device.
+- bf16 autocast and fused AdamW run on MPS (torch >= 2.13). `POCKET_TTS_AUTOCAST=bf16|fp16|off`
+  selects the MPS dtype; on an M2 Ultra all three measured the same.
+- `torch.mps.empty_cache()` after every optimizer step. Variable-length batches make the
+  MPS caching allocator keep a buffer set per shape and never return it; driver memory grows
+  ~10x past the live tensors, macOS pages, and throughput collapses (PR #255 measured
+  0.008 -> 0.11 it/s on an M5 Pro from this alone). The step log's `mps drv`/`cur` figures
+  show the failure mode: driver far above current, it/s decaying.
+- **macOS 14 MPS rejects conv1d inputs longer than 65,536 samples** (2.7 s at 24 kHz), which
+  every Mimi encoder call exceeds. `mimi_device_for()` probes once at start-up; if the probe
+  fails Mimi stays on CPU and its latents are moved to the FlowLM device. Newer macOS does not
+  have the limit and Mimi runs on MPS. `training/tests/test_apple_silicon.py` checks the
+  probe agrees with the OS and that CPU and MPS latents agree where both can run.
+- `pocket_tts` pins torch to one CPU thread at import (right for streaming inference). Training,
+  latent precompute and the aligner reclaim the cores; `POCKET_TTS_CPU_THREADS` caps them when
+  several processes share a box.
+- `precompute_latents` falls back to `os.cpu_count()` where `os.sched_getaffinity` is Linux-only.
+- `compile` stays off in the MPS config: measured no gain on MPS.
+
+Multi-process training stays CUDA-only, NCCL has no MPS backend. Measured on an M5 Pro
+(20-core GPU, 64 GB): 0.11 it/s sustained at `batch_size: 16`, `grad_accum_steps: 4` -- a
+multi-week run from scratch. Use it for development, smoke tests and finetuning; plan on an
+NVIDIA GPU for a full from-scratch run.
 
 ## Data
 

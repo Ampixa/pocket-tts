@@ -150,7 +150,7 @@ def setup(config_path: str) -> Run:
         betas=args.optim.betas,
         eps=args.optim.eps,
         weight_decay=args.optim.weight_decay,
-        fused=device.type == "cuda",
+        fused=device.type in ("cuda", "mps"),  # verified on MPS with torch >= 2.13 (PR #255)
     )
     ema = EMA(model, args.ema_decay) if args.ema_decay > 0 else None
 
@@ -270,6 +270,12 @@ def main(config_path: str):
         optimizer.step()
         if ema is not None:
             ema.update(model)
+        if device.type == "mps":
+            # Variable-length batches make the MPS caching allocator hoard a
+            # buffer set per shape, ballooning driver memory ~10x past the live
+            # tensors until macOS pages it; released each step, it stays bounded
+            # (upstream PR #255 measured 0.008 -> 0.11 it/s from this alone).
+            torch.mps.empty_cache()
 
         stop = torch.tensor(float(stop_requested), device=device)
         if run.world_size > 1:
@@ -297,8 +303,15 @@ def main(config_path: str):
             last_log, steps_since_log = now, 0
             values = {k: v.item() for k, v in metrics.items() if v.numel() == 1}
             shown = {k: f"{v:.4f}" for k, v in values.items()}
+            mem = ""
+            if device.type == "mps":
+                # Driver-allocated far above current-allocated is the paging
+                # failure mode the per-step empty_cache guards against.
+                drv = torch.mps.driver_allocated_memory() / 2**30
+                cur = torch.mps.current_allocated_memory() / 2**30
+                mem = f" | mps drv {drv:.1f}G cur {cur:.1f}G"
             logger.info(
-                f"step {step + 1} | lr {lr:.2e} | grad {grad_norm:.2f} | {speed:.2f} it/s | {shown}"
+                f"step {step + 1} | lr {lr:.2e} | grad {grad_norm:.2f} | {speed:.2f} it/s | {shown}{mem}"
             )
             progress.log("train", step + 1, values, lr=lr, grad_norm=grad_norm.item(), it_s=speed)
         if rank == 0 and step - start_step == VERBOSE_STEPS - 1:
