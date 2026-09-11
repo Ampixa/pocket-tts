@@ -101,7 +101,7 @@ def setup(config_path: str) -> Run:
     # pocket_tts/models/tts_model.py pins torch to a single CPU thread at import
     # for streaming inference. Training (Mimi on CPU, data collation) wants the
     # cores back.
-    torch.set_num_threads(max(1, (os.cpu_count() or 2) - 2))
+    torch.set_num_threads(int(os.environ.get("POCKET_TTS_CPU_THREADS", max(1, (os.cpu_count() or 2) - 2))))
     rank, world_size = get_rank(), get_world_size()
     torch.manual_seed(args.seed + rank)
     run_dir = args.run_dir

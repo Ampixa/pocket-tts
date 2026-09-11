@@ -51,7 +51,7 @@ LoadedEntry = tuple[dict[str, Any], npt.NDArray[np.float32] | Exception]
 app = typer.Typer(pretty_exceptions_show_locals=False)
 # pocket_tts pins torch to one CPU thread at import (streaming inference);
 # forced alignment of a corpus wants the cores.
-torch.set_num_threads(max(1, (os.cpu_count() or 2) - 2))
+torch.set_num_threads(int(os.environ.get("POCKET_TTS_CPU_THREADS", max(1, (os.cpu_count() or 2) - 2))))
 
 
 class ManifestKey(BaseModel):
