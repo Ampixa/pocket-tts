@@ -73,6 +73,23 @@ class Run:
     progress: ProgressLog
 
 
+def make_autocast(device: torch.device) -> torch.autocast:
+    """bf16 autocast on CUDA. On MPS the dtype is selectable with
+    POCKET_TTS_AUTOCAST=bf16|fp16|off: M1/M2 GPUs have no bf16 hardware and
+    emulate it, and fp16 there needs the loss to stay in range -- measure
+    before choosing. Default on MPS is bf16 for parity with CUDA."""
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    if device.type == "mps":
+        choice = os.environ.get("POCKET_TTS_AUTOCAST", "bf16")
+        if choice == "off":
+            return torch.autocast(device_type="mps", enabled=False)
+        return torch.autocast(
+            device_type="mps", dtype=torch.float16 if choice == "fp16" else torch.bfloat16
+        )
+    return torch.autocast(device_type=device.type, enabled=False)
+
+
 def setup(config_path: str) -> Run:
     """Resolve the config, build the models, restore any checkpoint."""
     setup_logging()
@@ -81,6 +98,10 @@ def setup(config_path: str) -> Run:
     torch.backends.cuda.enable_cudnn_sdp(False)
     args = load_args(config_path)
     device = init_distributed()
+    # pocket_tts/models/tts_model.py pins torch to a single CPU thread at import
+    # for streaming inference. Training (Mimi on CPU, data collation) wants the
+    # cores back.
+    torch.set_num_threads(max(1, (os.cpu_count() or 2) - 2))
     rank, world_size = get_rank(), get_world_size()
     torch.manual_seed(args.seed + rank)
     run_dir = args.run_dir
@@ -196,9 +217,7 @@ def main(config_path: str):
         )
     )
 
-    autocast = torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=device.type in ("cuda", "mps")
-    )
+    autocast = make_autocast(device)
     model.train()
     # scancel sends SIGTERM 30s (KillWait) before SIGKILL; finish the step and
     # checkpoint inside that window so a cancelled job resumes losslessly.
@@ -341,9 +360,7 @@ def validate(
             shuffle=False,
         )
     )
-    autocast = torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=device.type in ("cuda", "mps")
-    )
+    autocast = make_autocast(device)
     totals: dict[str, float] = {}
     n = 0
     for _ in range(args.num_valid_batches):

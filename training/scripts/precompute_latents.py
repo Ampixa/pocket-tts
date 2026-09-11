@@ -310,6 +310,7 @@ def main(config: str, batch_size: int = 16, decode_workers: int = 0):
     else:
         device = torch.device("cpu")
     torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_num_threads(max(1, (os.cpu_count() or 2) - 2))  # pocket_tts pins 1 at import
     mimi = load_frozen_mimi(model_config).to(device)
     if not args.data.train_jsonl:
         raise SystemExit("the config has no data.train_jsonl to precompute")
