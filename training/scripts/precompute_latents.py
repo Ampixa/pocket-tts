@@ -30,7 +30,7 @@ CALIBRATION_MARGIN_FRAMES = 4
 
 def default_decode_workers() -> int:
     """Size the decode pool from the cores this process may actually use."""
-    return max(4, len(os.sched_getaffinity(0)) - 2)
+    return max(4, (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 4)) - 2)
 
 
 # (path, start_sec, duration_sec, sample_rate): the arguments of _load_window.
@@ -301,7 +301,14 @@ def main(config: str, batch_size: int = 16, decode_workers: int = 0):
     logging.basicConfig(level=logging.INFO)
     args = load_args(config)
     model_config = load_model_config(args.model_config, args.model_overrides)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from training.distributed import mps_available
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif mps_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     torch.backends.cuda.matmul.allow_tf32 = True
     mimi = load_frozen_mimi(model_config).to(device)
     if not args.data.train_jsonl:

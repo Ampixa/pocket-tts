@@ -87,7 +87,7 @@ def setup(config_path: str) -> Run:
     progress = ProgressLog(run_dir / "progress.jsonl", enabled=rank == 0)
     if rank == 0:
         logger.info(f"logging to {log_path}")
-        gpu = torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu"
+        gpu = torch.cuda.get_device_name(device) if device.type == "cuda" else device.type
         logger.info(f"torch {torch.__version__} | {device} ({gpu}) | world size {world_size}")
         logger.info(f"resolved config from {config_path}:\n{dump_args(args).rstrip()}")
 
@@ -193,7 +193,7 @@ def main(config_path: str):
     )
 
     autocast = torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        device_type=device.type, dtype=torch.bfloat16, enabled=device.type in ("cuda", "mps")
     )
     model.train()
     # scancel sends SIGTERM 30s (KillWait) before SIGKILL; finish the step and
@@ -338,7 +338,7 @@ def validate(
         )
     )
     autocast = torch.autocast(
-        device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        device_type=device.type, dtype=torch.bfloat16, enabled=device.type in ("cuda", "mps")
     )
     totals: dict[str, float] = {}
     n = 0

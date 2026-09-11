@@ -16,9 +16,21 @@ def get_world_size() -> int:
     return dist.get_world_size() if dist.is_initialized() else 1
 
 
+def mps_available() -> bool:
+    return bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+
+
 def _require_cuda():
-    """Training on CPU is accidental (a mismatched torch build), not a use case."""
-    if torch.cuda.is_available() or os.environ.get("POCKET_TTS_ALLOW_CPU") == "1":
+    """Training on CPU is accidental (a mismatched torch build), not a use case.
+
+    Apple Silicon (MPS) is accepted as an accelerator: bf16 autocast and SDPA
+    backward both work there from torch 2.5 on, at a fraction of CUDA speed.
+    """
+    if (
+        torch.cuda.is_available()
+        or mps_available()
+        or os.environ.get("POCKET_TTS_ALLOW_CPU") == "1"
+    ):
         return
     if torch.version.cuda is None:
         hint = (
@@ -45,7 +57,14 @@ def init_distributed() -> torch.device:
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl")
         return torch.device("cuda", local_rank)
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    forced = os.environ.get("POCKET_TTS_DEVICE")
+    if forced:
+        return torch.device(forced)  # cuda | mps | cpu; for A/B timing and debugging
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if mps_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def shutdown_distributed():
