@@ -20,6 +20,25 @@ def mps_available() -> bool:
     return bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
 
 
+def mimi_device_for(device: torch.device) -> torch.device:
+    """Where the frozen Mimi codec runs.
+
+    MPS on macOS 14 rejects conv1d inputs longer than 65,536 samples (2.7 s at
+    24 kHz; "Output channels > 65536 not supported"), and every Mimi encoder
+    call is longer than that. Probe once; on failure keep Mimi on CPU and move
+    its latents to `device` after encoding. The FlowLM itself has no such op.
+    """
+    if device.type != "mps":
+        return device
+    try:
+        torch.nn.functional.conv1d(
+            torch.zeros(1, 1, 65537, device=device), torch.zeros(1, 1, 1, device=device)
+        )
+        return device
+    except NotImplementedError:
+        return torch.device("cpu")
+
+
 def _require_cuda():
     """Training on CPU is accidental (a mismatched torch build), not a use case.
 

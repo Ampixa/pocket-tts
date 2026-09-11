@@ -149,7 +149,8 @@ def write_samples(
                 logger.warning(f"sample {i} at step {step}: empty generation, skipped")
                 continue
             state = init_states(mimi, 1, (latents.shape[0] + 8) * ratio)
-            audio = mimi.decode_from_latent(latents[None].to(device), state)[0, 0]
+            mimi_device = next(mimi.parameters()).device
+            audio = mimi.decode_from_latent(latents[None].to(mimi_device), state)[0, 0]
             soundfile.write(
                 str(out_dir / f"step{step:08d}_{i}.wav"),
                 audio.float().cpu().numpy(),
