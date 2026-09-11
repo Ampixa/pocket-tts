@@ -97,7 +97,10 @@ What the branch changes, and why:
 
 - `distributed.py` accepts MPS; `POCKET_TTS_DEVICE=cuda|mps|cpu` forces a device.
 - bf16 autocast and fused AdamW run on MPS (torch >= 2.13). `POCKET_TTS_AUTOCAST=bf16|fp16|off`
-  selects the MPS dtype; on an M2 Ultra all three measured the same.
+  selects the MPS dtype. **M1/M2 GPUs have no bf16 hardware**: on an M2 Ultra a 4096x4096
+  matmul runs 18 TFLOPS fp32, 19 fp16, 9 bf16, and a 6-layer transformer step is 155 ms
+  fp32 / 159 fp16 / 260 bf16 -- use `off` there (fp32 costs nothing and needs no loss
+  scaling). On M3+ bf16 is native and the default is right.
 - `torch.mps.empty_cache()` after every optimizer step. Variable-length batches make the
   MPS caching allocator keep a buffer set per shape and never return it; driver memory grows
   ~10x past the live tensors, macOS pages, and throughput collapses (PR #255 measured
