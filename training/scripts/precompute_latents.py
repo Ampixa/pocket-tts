@@ -301,14 +301,13 @@ def main(config: str, batch_size: int = 16, decode_workers: int = 0):
     logging.basicConfig(level=logging.INFO)
     args = load_args(config)
     model_config = load_model_config(args.model_config, args.model_overrides)
-    from training.distributed import init_distributed, mimi_device_for
+    from training.distributed import init_distributed, place_mimi
 
-    # Same placement as train.py: MPS unless this macOS rejects Mimi's long
-    # conv1d inputs, in which case Mimi encodes on CPU.
-    device = mimi_device_for(init_distributed())
+    device = init_distributed()
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_num_threads(int(os.environ.get("POCKET_TTS_CPU_THREADS", max(1, (os.cpu_count() or 2) - 2))))  # pocket_tts pins 1 at import
-    mimi = load_frozen_mimi(model_config).to(device)
+    mimi = load_frozen_mimi(model_config)
+    place_mimi(mimi, device)  # chunked streaming encode where MPS limits conv1d length
     if not args.data.train_jsonl:
         raise SystemExit("the config has no data.train_jsonl to precompute")
     precompute_manifest(

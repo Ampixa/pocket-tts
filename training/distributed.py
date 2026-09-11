@@ -20,23 +20,38 @@ def mps_available() -> bool:
     return bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
 
 
-def mimi_device_for(device: torch.device) -> torch.device:
-    """Where the frozen Mimi codec runs.
-
-    MPS on macOS 14 rejects conv1d inputs longer than 65,536 samples (2.7 s at
-    24 kHz; "Output channels > 65536 not supported"), and every Mimi encoder
-    call is longer than that. Probe once; on failure keep Mimi on CPU and move
-    its latents to `device` after encoding. The FlowLM itself has no such op.
-    """
+def mps_conv1d_length_limited(device: torch.device) -> bool:
+    """macOS 14 MPS rejects conv1d inputs longer than 65,536 samples (2.7 s at
+    24 kHz; "Output channels > 65536 not supported"); every whole-clip Mimi
+    encoder call is longer than that. Newer macOS has no such limit."""
     if device.type != "mps":
-        return device
+        return False
     try:
         torch.nn.functional.conv1d(
             torch.zeros(1, 1, 65537, device=device), torch.zeros(1, 1, 1, device=device)
         )
-        return device
+        return False
     except NotImplementedError:
-        return torch.device("cpu")
+        return True
+
+
+def mimi_device_for(device: torch.device) -> torch.device:
+    """Where the frozen Mimi codec runs: with `device`. Kept for the tests and
+    for callers that only need the device; `place_mimi` does the placement."""
+    return device
+
+
+def place_mimi(mimi, device: torch.device) -> torch.device:
+    """Move Mimi to `device`. Where MPS cannot run its encoder on whole clips,
+    switch the encoder to chunked streaming encode (bit-for-bit the same
+    computation, see training/modules/mimi_chunked.py) instead of falling back
+    to CPU, which measured 37x slower."""
+    mimi.to(device)
+    if mps_conv1d_length_limited(device):
+        from training.modules.mimi_chunked import enable_chunked_encode
+
+        enable_chunked_encode(mimi)
+    return device
 
 
 def _require_cuda():

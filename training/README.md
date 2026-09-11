@@ -107,10 +107,12 @@ What the branch changes, and why:
   0.008 -> 0.11 it/s on an M5 Pro from this alone). The step log's `mps drv`/`cur` figures
   show the failure mode: driver far above current, it/s decaying.
 - **macOS 14 MPS rejects conv1d inputs longer than 65,536 samples** (2.7 s at 24 kHz), which
-  every Mimi encoder call exceeds. `mimi_device_for()` probes once at start-up; if the probe
-  fails Mimi stays on CPU and its latents are moved to the FlowLM device. Newer macOS does not
-  have the limit and Mimi runs on MPS. `training/tests/test_apple_silicon.py` checks the
-  probe agrees with the OS and that CPU and MPS latents agree where both can run.
+  every whole-clip Mimi encoder call exceeds. `place_mimi()` probes once at start-up; where the
+  limit exists, Mimi stays on MPS and encodes in chunks with carried streaming state
+  (`training/modules/mimi_chunked.py`) -- the same computation as the whole clip (measured
+  4e-7 relative on CPU, 3e-6 on MPS, the device floor) and 37x faster than falling back to
+  CPU. Newer macOS has no limit and encodes whole clips. `training/tests/test_apple_silicon.py`
+  checks the probe agrees with the OS and the chunked/whole-clip parity.
 - `pocket_tts` pins torch to one CPU thread at import (right for streaming inference). Training,
   latent precompute and the aligner reclaim the cores; `POCKET_TTS_CPU_THREADS` caps them when
   several processes share a box.

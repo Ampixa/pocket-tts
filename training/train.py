@@ -30,7 +30,7 @@ from training.args import TrainArgs, dump_args, load_args, save_args
 from training.checkpointing import EMA, latest_checkpoint, load_checkpoint, save_checkpoint
 from training.dataloader import DataLoader, SubprocessDataLoader, encode_batch
 from training.distributed import (
-    mimi_device_for,
+    place_mimi,
     avg_across_ranks,
     get_rank,
     get_world_size,
@@ -134,12 +134,11 @@ def setup(config_path: str) -> Run:
         save_args(args, run_dir / "args.yaml")
 
     model, mimi, _config = build_models(args)
-    mimi_device = mimi_device_for(device)
     model.to(device)
-    mimi.to(mimi_device)
-    if mimi_device != device and rank == 0:
-        logger.info(f"Mimi runs on {mimi_device} (MPS conv1d length limit); FlowLM on {device}")
-    ensure_train_latents(args, mimi, mimi_device, rank, world_size)
+    place_mimi(mimi, device)
+    if getattr(mimi, "chunked_encode_frames", None) and rank == 0:
+        logger.info(f"Mimi encodes in chunks of {mimi.chunked_encode_frames} frames (MPS conv1d length limit)")
+    ensure_train_latents(args, mimi, device, rank, world_size)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
         logger.info(f"flow_lm + objective: {n_params / 1e6:.1f}M trainable params")
