@@ -139,12 +139,21 @@ def setup(config_path: str) -> Run:
     if getattr(mimi, "chunked_encode_frames", None) and rank == 0:
         logger.info(f"Mimi encodes in chunks of {mimi.chunked_encode_frames} frames (MPS conv1d length limit)")
     ensure_train_latents(args, mimi, device, rank, world_size)
+    if args.trainable_only:
+        kept = 0
+        for name, param in model.named_parameters():
+            param.requires_grad = any(pat in name for pat in args.trainable_only)
+            kept += param.numel() if param.requires_grad else 0
+        if not kept:
+            raise SystemExit(f"trainable_only={args.trainable_only} matched no parameters")
+        if rank == 0:
+            logger.info(f"trainable_only={args.trainable_only}: {kept / 1e6:.2f}M params trainable")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
         logger.info(f"flow_lm + objective: {n_params / 1e6:.1f}M trainable params")
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=args.optim.lr,
         betas=args.optim.betas,
         eps=args.optim.eps,

@@ -71,6 +71,13 @@ class TrainArgs:
     # a released model's config. Avoids copying a whole config to change a
     # field, and keeps the language choice in one place.
     model_overrides: dict[str, tp.Any] = field(default_factory=dict)
+    # Substrings of parameter names to keep trainable; everything else is frozen.
+    # Empty (default) trains the whole FlowLM. Fine-tuning a *distilled* student
+    # with the full flow loss un-bakes its classifier-free guidance (measured:
+    # cloning 0.487 -> 0.435 by step 1000 even with dropout off), so restricting
+    # the update to e.g. ["conditioner"] lets a new language's text mapping move
+    # while the backbone that carries the guidance cannot.
+    trainable_only: list[str] = field(default_factory=list)
     # If true, warm-start the FlowLM from the config's weights_path (fine-tuning).
     # If false, only Mimi/tokenizer weights are used and the FlowLM is
     # re-initialized (training from scratch).
