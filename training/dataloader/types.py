@@ -34,3 +34,6 @@ class Batch:
     num_voice_prompt_frames: torch.Tensor  # [B] valid codec frames of each voice prompt
     tail_latents: torch.Tensor | None = None
     prompt_latents: torch.Tensor | None = None
+    # Cold-encoded stitch latents from the precompute, [B, S, C]. When set, the
+    # stitch is not re-encoded from `audio` and no waveform is needed at all.
+    stitch_latents: torch.Tensor | None = None

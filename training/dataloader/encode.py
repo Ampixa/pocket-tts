@@ -25,7 +25,12 @@ def encode_batch(
     # encode where it lives and hand the latents to `device`.
     mimi_device = next(mimi.parameters()).device
     if batch.tail_latents is not None:
-        stitch = mimi.encode_to_latent(batch.audio.to(mimi_device)).to(device)
+        if batch.stitch_latents is not None:
+            # Precomputed cold stitch: identical to encoding the window here,
+            # minus the need for the wav to exist on this machine.
+            stitch = batch.stitch_latents.to(device)
+        else:
+            stitch = mimi.encode_to_latent(batch.audio.to(mimi_device)).to(device)
         latents = torch.cat([stitch, batch.tail_latents.to(device)], dim=1)
         T = latents.shape[1]
         num_audio_frames = batch.num_audio_frames.to(device).clamp(max=T)

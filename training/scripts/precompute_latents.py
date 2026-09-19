@@ -19,6 +19,7 @@ from pocket_tts.utils.config import Config
 from pocket_tts.utils.utils import download_if_necessary
 from training.args import load_args
 from training.dataloader import Entry, _load_window
+from training.dataloader.loader import cut_to_frames, eligible_cuts, latent_target_frames
 from training.modules.builders import build_mimi, load_model_config
 
 logger = logging.getLogger("precompute_latents")
@@ -186,6 +187,61 @@ def _pending_chunks(
     return pending
 
 
+def _stitch_windows(
+    lens: list[int],
+    idxs: list[int],
+    lines: list[str],
+    max_frames: int,
+    stitch_frames: int,
+    stitch_cuts: int,
+    max_voice_prompt_sec: float,
+    max_duration_sec: float,
+    mimi: MimiModel,
+) -> list[tuple[list[int], list[int], list]]:
+    """Per row: (cut frames, first-word indices, audio windows) for K cuts.
+
+    The window is read with the loader's own call -- `_load_window` at
+    `start + cut/frame_rate` for `min(S, target)/frame_rate` seconds -- and
+    zero-padded to S frames of samples the way the loader's collate does. Not
+    sliced from the decoded chunk: that call has floating-point quirks (a start
+    that can land one sample early, a length that truncates to 67,199 samples)
+    which the teacher was trained through, so the stored stitch must reproduce
+    them, not correct them. K cuts are spread evenly over the eligible
+    boundaries so short and long prompts are both represented.
+    """
+    fs = mimi.frame_size
+    out = []
+    for b, n_samples in enumerate(lens):
+        entry = _parse_entry(lines[idxs[b]])
+        stored = min(_entry_frames(n_samples, mimi.sample_rate, mimi.frame_rate), max_frames)
+        cuts = eligible_cuts(entry, max_voice_prompt_sec) if stored > 1 else []
+        if len(cuts) > stitch_cuts:
+            picks = sorted({round(j * (len(cuts) - 1) / (stitch_cuts - 1))
+                            for j in range(stitch_cuts)}) if stitch_cuts > 1 else [0]
+            cuts = [cuts[p] for p in picks]
+        frames, words, windows = [], [], []
+        for cut_sec, word_index in cuts:
+            cut_frames = cut_to_frames(cut_sec, mimi.frame_rate, stored)
+            target = latent_target_frames(
+                entry, cut_frames, stored, mimi.frame_rate, max_duration_sec
+            )
+            row_stitch = min(stitch_frames, target)
+            piece = _load_window(
+                entry.path,
+                entry.start + cut_frames / mimi.frame_rate,
+                row_stitch / mimi.frame_rate,
+                mimi.sample_rate,
+            )
+            window = np.zeros(stitch_frames * fs, dtype=np.float32)
+            n = min(len(piece), stitch_frames * fs)
+            window[:n] = piece[:n]
+            frames.append(cut_frames)
+            words.append(word_index)
+            windows.append(window)
+        out.append((frames, words, windows))
+    return out
+
+
 def _write_chunk(
     latents: torch.Tensor,
     lens: list[int],
@@ -193,14 +249,22 @@ def _write_chunk(
     manifest: Path,
     mimi: MimiModel,
     tag: str,
+    stitches: list[tuple[list[int], list[int], torch.Tensor]] | None = None,
 ):
     for b, n_samples in enumerate(lens):
         frames = min(_entry_frames(n_samples, mimi.sample_rate, mimi.frame_rate), latents.shape[1])
         path = manifest.parent / _latents_name(manifest, idxs[b], tag)
+        payload = {"latents": latents[b, :frames].contiguous()}
+        if stitches is not None:
+            cut_frames, word_index, stitch_latents = stitches[b]
+            if cut_frames:
+                payload["stitch_cuts"] = torch.tensor(cut_frames, dtype=torch.long)
+                payload["stitch_words"] = torch.tensor(word_index, dtype=torch.long)
+                payload["stitch_latents"] = stitch_latents.contiguous()
         # Writer-unique tmp name: concurrent jobs racing on the same manifest
         # then only ever rename complete files (rename is atomic).
         tmp = path.with_suffix(f".tmp.{os.getpid()}")
-        safetensors.torch.save_file({"latents": latents[b, :frames].contiguous()}, str(tmp))
+        safetensors.torch.save_file(payload, str(tmp))
         tmp.rename(path)
 
 
@@ -215,6 +279,10 @@ def _encode_pending(
     tag: str,
     worker: int = 0,
     num_workers: int = 1,
+    stitch_frames: int = 0,
+    stitch_cuts: int = 0,
+    max_voice_prompt_sec: float = 5.0,
+    max_duration_sec: float = 20.0,
 ):
     pending = _pending_chunks(lines, manifest, batch_size, tag, worker, num_workers)
     lookahead = decode_workers + 2  # keep every decode worker busy
@@ -231,7 +299,26 @@ def _encode_pending(
             submitted += 1
         with torch.no_grad():
             latents = mimi.encode_to_latent(torch.from_numpy(arr).to(device)).cpu()
-        _write_chunk(latents, lens, idxs, manifest, mimi, tag)
+            stitches = None
+            if stitch_cuts > 0:
+                rows = _stitch_windows(
+                    lens, idxs, lines, latents.shape[1], stitch_frames, stitch_cuts,
+                    max_voice_prompt_sec, max_duration_sec, mimi,
+                )
+                flat = [w for _, _, windows in rows for w in windows]
+                encoded = None
+                if flat:
+                    # One batched call: every window starts from a fresh state,
+                    # which is exactly what makes these cold stitches.
+                    batch = torch.from_numpy(np.stack(flat))[:, None, :].to(device)
+                    encoded = mimi.encode_to_latent(batch).cpu()[:, :stitch_frames]
+                stitches, offset = [], 0
+                for frames, words, windows in rows:
+                    n = len(windows)
+                    lat = encoded[offset : offset + n] if n else torch.zeros(0, stitch_frames, latents.shape[-1])
+                    stitches.append((frames, words, lat))
+                    offset += n
+        _write_chunk(latents, lens, idxs, manifest, mimi, tag, stitches)
 
 
 def _write_manifest_and_meta(
@@ -242,6 +329,9 @@ def _write_manifest_and_meta(
     mimi: MimiModel,
     weights_path: str,
     mimi_hash: str,
+    stitch_cuts: int = 0,
+    max_voice_prompt_sec: float = 5.0,
+    max_duration_sec: float = 20.0,
 ):
     out_manifest = manifest.with_name(manifest.stem + "_latents.jsonl")
     _atomic_write_text(out_manifest, "\n".join(new_lines) + "\n")
@@ -251,6 +341,11 @@ def _write_manifest_and_meta(
         "frame_rate": mimi.frame_rate,
         "weights_path": weights_path,
         "mimi_hash": mimi_hash,
+        # > 0 means every row carries cold stitches at this many candidate cuts,
+        # chosen with this prompt window, and the loader needs no audio.
+        "stitch_cuts": stitch_cuts,
+        "max_voice_prompt_sec": max_voice_prompt_sec,
+        "max_duration_sec": max_duration_sec,
     }
     meta_path = manifest.with_name(manifest.stem + "_latents.meta.json")
     _atomic_write_text(meta_path, json.dumps(meta, indent=2) + "\n")
@@ -266,25 +361,37 @@ def precompute_manifest(
     weights_path: str,
     worker: int = 0,
     num_workers: int = 1,
+    stitch_cuts: int = 0,
+    max_voice_prompt_sec: float = 5.0,
+    max_duration_sec: float = 20.0,
 ):
     """Encode a manifest's utterances to per-utterance latents files.
 
     With num_workers > 1 each worker encodes a strided subset of chunks;
     worker 0 waits for the others' files and writes the manifest and meta.
+
+    stitch_cuts > 0 also stores cold stitch latents at that many candidate
+    cuts per row, which lets the loader train with no audio present. Such a
+    store gets its own tag so it cannot be confused with one that lacks them.
     """
     lines = manifest.read_text().splitlines()
     mimi_hash = mimi_encode_hash(mimi)
-    tag = mimi_hash[:8]
+    tag = mimi_hash[:8] + (f"s{stitch_cuts}" if stitch_cuts > 0 else "")
     (manifest.parent / "latents" / tag).mkdir(parents=True, exist_ok=True)
     decode_workers = decode_workers or default_decode_workers()
     pool = ProcessPoolExecutor(
         max_workers=decode_workers, mp_context=multiprocessing.get_context("spawn")
     )
-    if worker == 0:
+    stitch_frames, floor = 0, 0.0
+    if worker == 0 or stitch_cuts > 0:
+        # Every worker needs stitch_frames when it is storing stitches. The
+        # calibration pool is deterministic, so they all measure the same value.
         stitch_frames, floor = _calibrate(pool, lines, mimi, batch_size, device)
         logger.info(f"{manifest.name}: stitch_frames={stitch_frames} (noise floor {floor:.1e})")
     _encode_pending(
-        pool, mimi, device, lines, manifest, batch_size, decode_workers, tag, worker, num_workers
+        pool, mimi, device, lines, manifest, batch_size, decode_workers, tag, worker, num_workers,
+        stitch_frames=stitch_frames, stitch_cuts=stitch_cuts,
+        max_voice_prompt_sec=max_voice_prompt_sec, max_duration_sec=max_duration_sec,
     )
     if worker != 0:
         return
@@ -292,12 +399,19 @@ def precompute_manifest(
         time.sleep(5)
     new_lines = _annotated_lines(lines, manifest, tag)
     _write_manifest_and_meta(
-        manifest, new_lines, stitch_frames, floor, mimi, weights_path, mimi_hash
+        manifest, new_lines, stitch_frames, floor, mimi, weights_path, mimi_hash,
+        stitch_cuts=stitch_cuts, max_voice_prompt_sec=max_voice_prompt_sec,
+        max_duration_sec=max_duration_sec,
     )
 
 
 @app.command()
-def main(config: str, batch_size: int = 16, decode_workers: int = 0):
+def main(
+    config: str,
+    batch_size: int = 16,
+    decode_workers: int = 0,
+    stitch_cuts: int = 0,
+):
     logging.basicConfig(level=logging.INFO)
     args = load_args(config)
     model_config = load_model_config(args.model_config, args.model_overrides)
@@ -317,6 +431,9 @@ def main(config: str, batch_size: int = 16, decode_workers: int = 0):
         batch_size,
         decode_workers,
         str(model_config.weights_path),
+        stitch_cuts=stitch_cuts,
+        max_voice_prompt_sec=args.data.max_voice_prompt_sec,
+        max_duration_sec=args.data.max_duration_sec,
     )
 
 

@@ -45,6 +45,70 @@ def _prefetch(iterator: Iterator[Batch], depth: int = 4) -> Iterator[Batch]:
         yield item
 
 
+MIN_CUT_SEC = 1.0  # keep at least this much audio on both sides of a cut
+
+
+def eligible_cuts(
+    entry: Entry, max_voice_prompt_sec: float, min_cut_sec: float = MIN_CUT_SEC
+) -> list[tuple[float, int]]:
+    """Word boundaries the loader may cut at: (cut in seconds, index of the first
+    word after it). Shared with the precompute so stored stitches land on the
+    same cuts the loader draws from."""
+    if not entry.words:
+        return []
+    cuts = []
+    for i in range(1, len(entry.words)):
+        prev, cur = entry.words[i - 1], entry.words[i]
+        if prev["end"] is None or cur["start"] is None:
+            continue
+        cut = 0.5 * (prev["end"] + cur["start"])
+        if cut >= min_cut_sec and entry.duration - cut >= min_cut_sec:
+            cuts.append((cut, i))
+    if not cuts:
+        return []
+    # The prompt is the contiguous start of the utterance; eligible cuts are the
+    # boundaries whose preceding word ends inside the prompt window.
+    window = max_voice_prompt_sec if max_voice_prompt_sec > 0 else float("inf")
+    eligible = [
+        (c, i)
+        for c, i in cuts
+        if entry.words[i - 1].get("end") is not None and entry.words[i - 1]["end"] < window
+    ]
+    return eligible or cuts[:1]  # degenerate windows: earliest valid cut
+
+
+TRAIL_SEC = 0.2  # silence kept after the last word, so EOS has a consistent target
+
+
+def last_word_end(entry: Entry) -> float | None:
+    """End of the last aligned word; None without alignment."""
+    if not entry.words:
+        return None
+    ends = [w["end"] for w in entry.words if w.get("end") is not None]
+    return max(ends) if ends else None
+
+
+def latent_target_frames(
+    entry: Entry, cut_frames: int, stored: int, frame_rate: float, max_duration_sec: float
+) -> int:
+    """Frames of target after the cut. Shared with the precompute, which needs
+    the same number to read the same stitch window the loader would."""
+    cut_sec = cut_frames / frame_rate
+    end = entry.duration
+    last = last_word_end(entry)
+    if last is not None and last > cut_sec:
+        end = min(entry.duration, last + TRAIL_SEC)
+    target_frames = int(min(end - cut_sec, max_duration_sec) * frame_rate)
+    return max(1, min(target_frames, stored - cut_frames))
+
+
+def cut_to_frames(cut_sec: float, frame_rate: float, stored: int) -> int:
+    """Frame index for a cut, clamped inside the stored latents. One rule,
+    used by the loader and the precompute, so a stored stitch and a live one
+    start on the same frame."""
+    return min(max(round(cut_sec * frame_rate), 1), stored - 1)
+
+
 class DataLoader:
     def __init__(
         self,
@@ -76,14 +140,27 @@ class DataLoader:
         self.frame_size = int(sample_rate / frame_rate)
         meta_path = Path(jsonl).with_suffix(".meta.json")
         self.stitch_frames = 0
+        self.stored_stitches = False
         if meta_path.exists():
             meta = json.loads(meta_path.read_text())
             self.stitch_frames = int(meta["stitch_frames"])
             self.latents_root = Path(jsonl).parent
+            self.stored_stitches = int(meta.get("stitch_cuts", 0)) > 0
             logger.info(f"latent mode: stitch_frames={self.stitch_frames} from {meta_path.name}")
+            if self.stored_stitches:
+                stored_window = float(meta.get("max_voice_prompt_sec", max_voice_prompt_sec))
+                logger.info(
+                    f"stored stitches: {meta['stitch_cuts']} cuts per row, no audio reads"
+                )
+                if abs(stored_window - max_voice_prompt_sec) > 1e-6:
+                    logger.warning(
+                        f"stored stitches were chosen with max_voice_prompt_sec="
+                        f"{stored_window}, training uses {max_voice_prompt_sec}; the cut "
+                        "set is the precompute's, not this run's"
+                    )
 
-    MIN_CUT_SEC = 1.0  # keep at least this much audio on both sides of a cut
-    TRAIL_SEC = 0.2  # silence kept after the last word, so EOS has a consistent target
+    MIN_CUT_SEC = MIN_CUT_SEC
+    TRAIL_SEC = TRAIL_SEC
 
     def _cap_prompt(self, prompt: npt.NDArray[np.float32]) -> tuple[npt.NDArray[np.float32], int]:
         """Truncate the prompt to the configured cap; collation pads to batch max."""
@@ -94,44 +171,17 @@ class DataLoader:
 
     @staticmethod
     def _last_word_end(entry: Entry) -> float | None:
-        """End of the last aligned word, i.e. where the speech actually stops.
-
-        None when the entry carries no alignment, which is the documented
-        manifest format without `words`.
-        """
-        if not entry.words:
-            return None
-        ends = [w["end"] for w in entry.words if w.get("end") is not None]
-        return max(ends) if ends else None
+        """End of the last aligned word, i.e. where the speech actually stops."""
+        return last_word_end(entry)
 
     def _choose_cut(self, entry: Entry) -> tuple[float, str] | None:
         """(cut in seconds, transcript of the words after it), None without alignment."""
         # Cut the utterance at a random point between two aligned words:
         # audio before the cut = voice conditioning, audio after = target,
         # paired with the remaining words as text (see training/scripts/align_data.py).
-        if not entry.words:
-            return None
-        cuts = []
-        for i in range(1, len(entry.words)):
-            prev, cur = entry.words[i - 1], entry.words[i]
-            if prev["end"] is None or cur["start"] is None:
-                continue
-            cut = 0.5 * (prev["end"] + cur["start"])
-            if cut >= self.MIN_CUT_SEC and entry.duration - cut >= self.MIN_CUT_SEC:
-                cuts.append((cut, i))
-        if cuts:
-            # The prompt is the (contiguous) start of the utterance.
-            # Eligible cuts are word boundaries whose preceding word ends
-            # inside the prompt window; the draw is uniform over 1..k
-            # eligible words, so prompt length varies and the target
-            # keeps most of the utterance.
-            window = self.max_voice_prompt_sec if self.max_voice_prompt_sec > 0 else float("inf")
-            eligible = [
-                (c, i)
-                for c, i in cuts
-                if entry.words[i - 1].get("end") is not None and entry.words[i - 1]["end"] < window
-            ]
-            cuts = eligible or cuts[:1]  # degenerate windows: earliest valid cut
+        # The draw is uniform over the eligible boundaries, so prompt length
+        # varies and the target keeps most of the utterance.
+        cuts = eligible_cuts(entry, self.max_voice_prompt_sec, self.MIN_CUT_SEC)
         if not cuts:
             return None
         cut, i = self.rng.choice(cuts)
@@ -186,22 +236,35 @@ class DataLoader:
         with safe_open(str(path), framework="pt") as f:
             return f.get_tensor("latents")
 
+    def _load_latents_with_stitches(
+        self, latents_file: str
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """(latents, stitch_cuts, stitch_words, stitch_latents); the last three are
+        None for a row the precompute found no eligible cut for."""
+        path = self.latents_root / latents_file
+        with safe_open(str(path), framework="pt") as f:
+            keys = set(f.keys())
+            lat = f.get_tensor("latents")
+            if "stitch_latents" not in keys:
+                return lat, None, None, None
+            return (
+                lat,
+                f.get_tensor("stitch_cuts"),
+                f.get_tensor("stitch_words"),
+                f.get_tensor("stitch_latents"),
+            )
+
     def _latent_cut(self, entry: Entry, stored: int) -> tuple[int, str]:
         chosen = self._choose_cut(entry)
         if chosen is None or stored <= 1:
             return 0, entry.transcript
         cut, text = chosen
-        cut_frames = min(max(round(cut * self.frame_rate), 1), stored - 1)
-        return cut_frames, text
+        return cut_to_frames(cut, self.frame_rate, stored), text
 
     def _latent_target_frames(self, entry: Entry, cut_frames: int, stored: int) -> int:
-        cut_sec = cut_frames / self.frame_rate
-        end = entry.duration
-        last = self._last_word_end(entry)
-        if last is not None and last > cut_sec:
-            end = min(entry.duration, last + self.TRAIL_SEC)
-        target_frames = int(min(end - cut_sec, self.max_duration_sec) * self.frame_rate)
-        return max(1, min(target_frames, stored - cut_frames))
+        return latent_target_frames(
+            entry, cut_frames, stored, self.frame_rate, self.max_duration_sec
+        )
 
     def _latent_prompt(self, lat: torch.Tensor, cut_frames: int) -> torch.Tensor:
         stored = lat.shape[0]
@@ -215,10 +278,49 @@ class DataLoader:
         start = self.rng.randint(0, max(0, stored - cap))
         return lat[start : start + cap]
 
+    def _sample_latent_stored(self, entry: Entry) -> tuple[Any, ...]:
+        """Like _sample_latent, but the stitch comes from the precompute.
+
+        Returns (stitch latents [S, C], tokens, prompt latents, tail latents,
+        target frames). No file other than the latents file is opened, which is
+        what lets a latent bundle train on a machine that has no corpus.
+        """
+        assert entry.latents_file is not None, f"{entry.path}: not a latents entry"
+        lat, cuts, words, stitches = self._load_latents_with_stitches(entry.latents_file)
+        stored = lat.shape[0]
+        S = self.stitch_frames
+        if stitches is None or stitches.shape[0] == 0:
+            # No eligible cut for this row: the whole utterance is the target and
+            # the prompt is a random window, as the audio path does. The stored
+            # latents were encoded from frame 0 with a fresh state, so they *are*
+            # the cold stitch; pad to S because the audio path encodes S frames
+            # and the mask trims what is beyond the target anyway.
+            cut_frames, text = 0, entry.transcript
+            stitch = lat[:S]
+            if stitch.shape[0] < S:
+                stitch = torch.cat([stitch, torch.zeros(S - stitch.shape[0], lat.shape[1])])
+        else:
+            k = self.rng.randrange(stitches.shape[0])
+            cut_frames = int(cuts[k])
+            word_index = int(words[k])
+            text = " ".join(w["word"] for w in entry.words[word_index:])
+            stitch = stitches[k]
+            assert stitch.shape[0] == S, (
+                f"{entry.latents_file}: stored stitch has {stitch.shape[0]} frames, "
+                f"meta says {S}"
+            )
+        tokens = torch.tensor(self.tokenize(text), dtype=torch.long)
+        target_frames = self._latent_target_frames(entry, cut_frames, stored)
+        stitch_frames = min(S, target_frames)
+        tail = lat[cut_frames + stitch_frames : cut_frames + target_frames]
+        return stitch, tokens, self._latent_prompt(lat, cut_frames), tail, target_frames
+
     def _sample_latent(self, entry: Entry) -> tuple[Any, ...]:
         """(stitch wav, tokens, prompt latents, tail latents, target frames)."""
         assert self.stitch_frames > 0, f"{entry.path}: latents entry but no meta file loaded"
         assert entry.latents_file is not None, f"{entry.path}: not a latents entry"
+        if self.stored_stitches:
+            return self._sample_latent_stored(entry)
         lat = self._load_latents(entry.latents_file)
         cut_frames, text = self._latent_cut(entry, lat.shape[0])
         tokens = torch.tensor(self.tokenize(text), dtype=torch.long)
@@ -252,14 +354,23 @@ class DataLoader:
     def _collate_latent(self, batch: list[tuple[Any, ...]]) -> Batch:
         stitches, tokens, prompts, tails, target_frames = zip(*batch, strict=True)
         num_prompt_frames = torch.tensor([max(1, p.shape[0]) for p in prompts], dtype=torch.long)
+        if self.stored_stitches:
+            # Every stored stitch is exactly S frames, so they stack without
+            # padding, and there is no audio to collate.
+            stitch_latents = torch.stack([s for s in stitches])
+            audio = torch.zeros(len(stitches), 1, 0)
+        else:
+            stitch_latents = None
+            audio = self._collate_stitch_audio(stitches)
         return Batch(
-            self._collate_stitch_audio(stitches),
+            audio,
             torch.tensor(target_frames, dtype=torch.long),
             list(tokens),
             torch.zeros(len(stitches), 1, 0),
             num_prompt_frames,
             tail_latents=self._pad_latents(tails, 0),
             prompt_latents=self._pad_latents(prompts, 1),
+            stitch_latents=stitch_latents,
         )
 
     def get_entry(self, index: int) -> Entry:
