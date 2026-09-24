@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from pocket_tts.default_parameters import DEFAULT_EOS_THRESHOLD
 from pocket_tts.models.flow_lm import FlowLMModel
 from pocket_tts.modules.stateful_module import ModelState, increment_steps, init_states
 
@@ -85,6 +86,39 @@ class TrainableTTS(nn.Module):
 
         z = backbone_z(fl, cfg_dropout=self.training)  # [B, T, dim]
 
+        # Include each row's first invalid position so EOS has a target. The
+        # longest row in a padded batch may have no EOS target; report the count
+        # alongside its rate so a zero-denominator batch is not misread.
+        is_eos = ~mask
+        is_eos[:, 0] = False
+        shifted_mask = torch.cat([mask[:, :1], mask[:, :-1]], dim=1)
+        eos_positions = is_eos & shifted_mask
+        non_eos_positions = ~is_eos & shifted_mask
+
+        def eos_metrics(
+            module: FlowLMModel, hidden: torch.Tensor, prefix: str
+        ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+            logits = module.out_eos(hidden).squeeze(-1).float()
+            pointwise = torch.where(is_eos, F.softplus(-logits), F.softplus(logits))
+            loss = (pointwise * shifted_mask).sum() / shifted_mask.sum().clamp(min=1)
+            with torch.no_grad():
+                end_count = eos_positions.sum()
+                non_end_count = non_eos_positions.sum()
+                metrics = {
+                    f"{prefix}eos_end_count": end_count.detach(),
+                    f"{prefix}eos_end_recall": (
+                        ((logits > DEFAULT_EOS_THRESHOLD) & eos_positions).sum()
+                        / end_count.clamp(min=1)
+                    ).detach(),
+                    f"{prefix}eos_early_rate": (
+                        ((logits > DEFAULT_EOS_THRESHOLD) & non_eos_positions).sum()
+                        / non_end_count.clamp(min=1)
+                    ).detach(),
+                }
+            return loss, metrics
+
+        eos_loss, eos_stats = eos_metrics(fl, z, "")
+
         if self.distill_teacher is not None:
             # Latent CFG distillation: the student's backbone regresses onto the
             # teacher's guidance-combined output; flow/EOS heads stay frozen.
@@ -93,19 +127,18 @@ class TrainableTTS(nn.Module):
                 z_cond = backbone_z(teacher, cfg_dropout=False)
                 z_null = backbone_z(teacher, cfg_dropout=False, force_null=True)
                 z_t = z_null + self.args.distill_cfg_coef * (z_cond - z_null)
-            shifted_mask = torch.cat([mask[:, :1], mask[:, :-1]], dim=1)
             denom = shifted_mask.sum().clamp(min=1)
-            loss = ((z - z_t).square().mean(dim=-1) * shifted_mask).sum() / denom
-            return loss, {"distill_mse": loss.detach(), "loss": loss.detach()}
-
-        # EOS loss: 1 on the first invalid position, computed over valid
-        # positions plus that first invalid one (mask shifted right).
-        is_eos = ~mask
-        is_eos[:, 0] = False
-        eos_logits = fl.out_eos(z).squeeze(-1)
-        shifted_mask = torch.cat([mask[:, :1], mask[:, :-1]], dim=1)
-        eos_loss = is_eos * F.softplus(-eos_logits) + ~is_eos * F.softplus(eos_logits)
-        eos_loss = (eos_loss * shifted_mask).sum() / shifted_mask.sum().clamp(min=1)
+            mse = ((z - z_t).square().mean(dim=-1) * shifted_mask).sum() / denom
+            _, teacher_eos_stats = eos_metrics(teacher, z_t, "teacher_")
+            loss = mse + self.args.distill_eos_loss_weight * eos_loss
+            metrics = {
+                "distill_mse": mse.detach(),
+                "eos_loss": eos_loss.detach(),
+                "loss": loss.detach(),
+                **eos_stats,
+                **teacher_eos_stats,
+            }
+            return loss, metrics
 
         # Flow loss on valid positions, optionally with several noise draws per
         # position (flow_batch_multiplier).
@@ -123,7 +156,12 @@ class TrainableTTS(nn.Module):
         # Detach every metric: they are logging-only, and non-detached extra
         # outputs give the compiled backward immutable ZeroTensor grads.
         metrics = {k: v.detach() if torch.is_tensor(v) else v for k, v in metrics.items()}
-        metrics.update(flow_loss=flow_loss.detach(), eos_loss=eos_loss.detach(), loss=loss.detach())
+        metrics.update(
+            flow_loss=flow_loss.detach(),
+            eos_loss=eos_loss.detach(),
+            loss=loss.detach(),
+            **eos_stats,
+        )
         return loss, metrics
 
     @torch.no_grad()

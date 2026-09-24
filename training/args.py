@@ -98,6 +98,10 @@ class TrainArgs:
 
     flow_batch_multiplier: int = 1  # extra flow-loss samples per backbone position
     eos_loss_weight: float = 0.1
+    # Optional ground-truth EOS supervision during backbone distillation. The
+    # EOS head remains frozen; gradients reach the student backbone through it.
+    # Zero preserves the original pure activation-regression objective.
+    distill_eos_loss_weight: float = 0.0
     text_dropout: float = 0.2  # CFG dropout of the text prefix
     voice_dropout: float = 0.2  # CFG dropout of the voice prefix
     # Update the emb_mean/emb_std latent-normalization buffers by EMA for this
@@ -151,6 +155,11 @@ class TrainArgs:
     # keeps the early feature extractors contiguous.
 
     def __post_init__(self):
+        if self.distill_eos_loss_weight < 0:
+            raise ValueError(
+                "distill_eos_loss_weight must be >= 0, "
+                f"got {self.distill_eos_loss_weight}"
+            )
         if self.grad_accum_steps < 1:
             raise ValueError(f"grad_accum_steps must be >= 1, got {self.grad_accum_steps}")
         if self.num_ckpt_keep < 1:

@@ -71,6 +71,10 @@ class TestArgValidation:
         with pytest.raises(ValueError, match="num_ckpt_keep"):
             TrainArgs(num_ckpt_keep=0)
 
+    def test_negative_distill_eos_loss_weight_is_rejected(self):
+        with pytest.raises(ValueError, match="distill_eos_loss_weight"):
+            TrainArgs(distill_eos_loss_weight=-0.1)
+
     def test_zero_frequencies_are_rejected(self):
         for field in ("valid_freq", "ckpt_freq", "log_freq"):
             kwargs: dict[str, Any] = {field: 0}

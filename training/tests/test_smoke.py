@@ -124,6 +124,9 @@ def test_cfg_distill():
     model.train()
     loss, metrics = model(*make_batch())
     assert "distill_mse" in metrics
+    assert "eos_loss" in metrics
+    assert "teacher_eos_end_recall" in metrics
+    assert metrics["eos_end_count"] > 0
     assert loss.item() < 1e-8, f"student==teacher at coef 1 should give ~0 loss, got {loss.item()}"
 
     model.args.distill_cfg_coef = 3.0  # now the target differs from the student
@@ -133,6 +136,27 @@ def test_cfg_distill():
     assert all(p.grad is None for p in model.flow_lm.flow_net.parameters())
     backbone_grads = [p.grad for p in model.flow_lm.transformer.parameters() if p.grad is not None]
     assert backbone_grads and torch.isfinite(torch.cat([g.flatten() for g in backbone_grads])).all()
+
+    # Auxiliary EOS supervision must move the backbone through the frozen head
+    # without changing the original pure-MSE behavior when its weight is zero.
+    model.zero_grad(set_to_none=True)
+    model.args.distill_cfg_coef = 1.0
+    model.args.distill_eos_loss_weight = 0.5
+    loss, metrics = model(*make_batch())
+    torch.testing.assert_close(loss, 0.5 * metrics["eos_loss"], atol=1e-7, rtol=1e-5)
+    loss.backward()
+    assert all(p.grad is None for p in model.flow_lm.out_eos.parameters())
+    backbone_grads = [p.grad for p in model.flow_lm.transformer.parameters() if p.grad is not None]
+    assert backbone_grads and any(torch.count_nonzero(g) for g in backbone_grads)
+
+    # A batch with no padded end has no observable EOS target. Diagnostics must
+    # stay finite and report that absence instead of fabricating an end.
+    latents, mask, text, voice = make_batch()
+    mask.fill_(True)
+    loss, metrics = model(latents, mask, text, voice)
+    assert torch.isfinite(loss)
+    assert metrics["eos_end_count"] == 0
+    assert metrics["eos_end_recall"] == 0
 
 
 @pytest.mark.parametrize("num_time_conds", [0, 1, 2])
