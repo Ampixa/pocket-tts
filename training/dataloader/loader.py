@@ -30,18 +30,25 @@ logger = logging.getLogger(__name__)
 
 def _prefetch(iterator: Iterator[Batch], depth: int = 4) -> Iterator[Batch]:
     """Run the (synchronous, IO-bound) loader in a background thread."""
-    q: queue.Queue[Batch | None] = queue.Queue(maxsize=depth)
+    q: queue.Queue[Batch | Exception | None] = queue.Queue(maxsize=depth)
 
     def worker():
-        for item in iterator:
-            q.put(item)
-        q.put(None)
+        try:
+            for item in iterator:
+                q.put(item)
+        except Exception as error:
+            logger.exception("data loader prefetch failed")
+            q.put(error)
+        finally:
+            q.put(None)
 
     threading.Thread(target=worker, daemon=True).start()
     while True:
         item = q.get()
         if item is None:
             return
+        if isinstance(item, Exception):
+            raise RuntimeError("data loader prefetch failed") from item
         yield item
 
 
@@ -135,7 +142,6 @@ class DataLoader:
         self.max_voice_prompt_sec = max_voice_prompt_sec
         self.shuffle = shuffle
         self.io_workers = io_workers
-        self._failures = 0
         self.rng = random.Random(seed)
         self.frame_size = int(sample_rate / frame_rate)
         meta_path = Path(jsonl).with_suffix(".meta.json")
@@ -384,14 +390,11 @@ class DataLoader:
             d.get("latents_file"),
         )
 
-    def _sample_or_none(self, entry: Entry) -> tuple[Any, ...] | None:
+    def _sample_checked(self, entry: Entry) -> tuple[Any, ...]:
         try:
             return self._sample(entry)
-        except Exception as exc:  # noqa: BLE001 — skip unreadable samples, whatever the cause
-            self._failures += 1
-            if self._failures % 1000 == 1:
-                logger.warning(f"skipping unreadable sample ({self._failures} so far): {exc}")
-            return None
+        except Exception as error:
+            raise RuntimeError(f"{self.jsonl}: failed to load {entry.path}: {error}") from error
 
     def __iter__(self) -> Iterator[Batch]:
         # Batches are produced in a background thread (the loader is IO-bound)
@@ -399,7 +402,6 @@ class DataLoader:
         return _prefetch(self._batches())
 
     def _batches(self) -> Iterator[Batch]:
-        self._failures = 0
         # Each sample is two small reads from network storage, so the loader is
         # latency-bound rather than CPU-bound: fetching a batch's samples
         # concurrently keeps the GPUs fed. sphn releases the GIL, so threads are
@@ -423,7 +425,7 @@ class DataLoader:
                 # (unlike sphn's audio reads), so parsing it on the worker
                 # threads just contends with itself instead of overlapping.
                 chunk_entries = [self.get_entry(i) for i in chunk]
-                got = [s for s in pool.map(self._sample_or_none, chunk_entries) if s is not None]
+                got = list(pool.map(self._sample_checked, chunk_entries))
                 samples.extend(got)
                 if len(samples) < self.batch_size:
                     continue
@@ -450,6 +452,6 @@ class DataLoader:
                 yield Batch(audio, frames, list(tokens), voice, num_voice_prompt_frames)
             if not yielded:
                 raise ValueError(
-                    f"no readable samples in {self.jsonl}: every entry failed to load "
-                    f"({self._failures} failures). Check the paths in the manifest."
+                    f"no complete batch in {self.jsonl}; check the manifest size "
+                    f"and batch_size={self.batch_size}"
                 )

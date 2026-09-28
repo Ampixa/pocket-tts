@@ -90,7 +90,7 @@ class SubprocessDataLoader:
         batches = 0
         while True:
             try:
-                batch = self._queue.get(timeout=60)
+                batch = self._queue.get(timeout=5)
             except queue.Empty:
                 self._check_procs()
                 continue
