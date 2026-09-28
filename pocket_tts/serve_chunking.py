@@ -3,8 +3,7 @@
 import re
 from collections.abc import Callable
 
-MAX_DEMO_TOKENS = 35
-MAX_DEMO_LINES = 2
+MAX_DEMO_TOKENS = 18
 MAX_DEMO_CHUNKS = 80
 MAX_DEMO_CHARACTERS = 12_000
 
@@ -12,9 +11,9 @@ _SENTENCE_BREAK = re.compile(r"(?<=[.!?।॥])\s+")
 
 
 def split_demo_text(text: str, token_count: Callable[[str], int]) -> list[str]:
-    """Keep line pairs together where possible, never exceeding the token budget.
+    """Keep each input line separate, never exceeding the token budget.
 
-    Sentence boundaries are preferred inside a line pair. If a single sentence
+    Sentence boundaries are preferred inside a line. If a single sentence
     is too long, split at word boundaries; an unsplittable word is rejected
     explicitly instead of being passed to the model over budget.
     """
@@ -28,9 +27,8 @@ def split_demo_text(text: str, token_count: Callable[[str], int]) -> list[str]:
         raise ValueError("Text cannot be empty")
 
     chunks: list[str] = []
-    for offset in range(0, len(lines), MAX_DEMO_LINES):
-        line_pair = " ".join(lines[offset : offset + MAX_DEMO_LINES])
-        sentences = [part.strip() for part in _SENTENCE_BREAK.split(line_pair) if part.strip()]
+    for line in lines:
+        sentences = [part.strip() for part in _SENTENCE_BREAK.split(line) if part.strip()]
         current = ""
 
         def flush() -> None:

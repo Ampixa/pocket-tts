@@ -206,7 +206,7 @@ def test_later_chunk_error_is_not_silently_accepted(monkeypatch: pytest.MonkeyPa
         def generate_audio_stream(
             self, model_state: dict[str, Any], text_to_generate: str
         ) -> Iterator[torch.Tensor]:
-            if "Line 3" in text_to_generate:
+            if "Line 2" in text_to_generate:
                 raise RuntimeError("decoder failed")
             yield from super().generate_audio_stream(model_state, text_to_generate)
 
@@ -216,9 +216,9 @@ def test_later_chunk_error_is_not_silently_accepted(monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(RuntimeError, match="TTS failed on chunk 2/2: decoder failed"):
         TestClient(main.web_app).post("/tts", data={
-            "text": "Line 1.\nLine 2.\nLine 3.\nLine 4."
+            "text": "Line 1.\nLine 2."
         })
-    assert fake_model.texts_used == ["Line 1. Line 2."]
+    assert fake_model.texts_used == ["Line 1."]
 
 
 def test_tts_endpoint_generates_long_text_in_one_stream(monkeypatch: pytest.MonkeyPatch):
@@ -230,7 +230,7 @@ def test_tts_endpoint_generates_long_text_in_one_stream(monkeypatch: pytest.Monk
     response = TestClient(main.web_app).post("/tts", data={"text": "\n".join(lines)})
 
     assert response.status_code == 200
-    assert fake_model.texts_used == [" ".join(lines[n:n + 2]) for n in (0, 2, 4)]
+    assert fake_model.texts_used == lines
     assert response.content.count(b"RIFF") == 1
     assert response.content.count(b"WAVE") == 1
 
