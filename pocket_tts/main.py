@@ -1,4 +1,6 @@
+import html
 import io
+import json
 import logging
 import os
 import sys
@@ -13,7 +15,7 @@ import typer
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
 from pocket_tts.data.audio import stream_audio_chunks
 from pocket_tts.default_parameters import (
@@ -47,6 +49,11 @@ tts_model: TTSModel | None = None
 # State of the voice served when a request doesn't specify one. It is resolved once from the
 # `serve` options, so that requests never pay for the encoding of the default voice.
 default_voice_state: ModelState | None = None
+preset_voice_states: dict[str, ModelState] = {}
+preset_voice_files: dict[str, Path] = {}
+preset_voice_details: list[dict[str, str]] = []
+# TTSModel is stateful and not thread-safe; a demo may receive overlapping requests.
+generation_lock = threading.Lock()
 
 web_app = FastAPI(
     title="Kyutai Pocket TTS API", description="Text-to-Speech generation API", version="1.0.0"
@@ -78,7 +85,10 @@ async def root() -> str:
     # Replace the placeholder with the actual default text prompt
     origin = str(_loaded_model().origin)
     print(origin)
-    content = content.replace("DEFAULT_TEXT_PROMPT", get_default_text_for_language(origin))
+    prompt = os.environ.get("POCKET_TTS_DEMO_TEXT") or get_default_text_for_language(origin)
+    title = os.environ.get("POCKET_TTS_DEMO_TITLE") or "Pocket TTS"
+    content = content.replace("DEFAULT_TEXT_PROMPT", html.escape(prompt))
+    content = content.replace("DEFAULT_DEMO_TITLE", html.escape(title))
     return content
 
 
@@ -87,11 +97,80 @@ async def health() -> dict[str, str]:
     return {"status": "healthy"}
 
 
-def write_to_queue(queue: Queue[bytes | None], text_to_generate: str, model_state: ModelState):
+@web_app.get("/voice-presets")
+async def voice_presets() -> list[dict[str, str]]:
+    """List only the verified local references loaded when the server started."""
+    return preset_voice_details
+
+
+@web_app.get("/voice-presets/{voice_id}/audio")
+async def voice_preset_audio(voice_id: str) -> FileResponse:
+    path = preset_voice_files.get(voice_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Unknown voice preset")
+    return FileResponse(path, media_type="audio/wav")
+
+
+def load_voice_presets(manifest_path: str | None, model: TTSModel) -> None:
+    """Validate and encode a small, local voice bank for the inference UI."""
+    global preset_voice_states, preset_voice_files, preset_voice_details
+    states: dict[str, ModelState] = {}
+    files: dict[str, Path] = {}
+    details: list[dict[str, str]] = []
+    if manifest_path is None:
+        preset_voice_states = states
+        preset_voice_files = files
+        preset_voice_details = details
+        return
+
+    manifest = Path(manifest_path).resolve(strict=True)
+    bank = json.loads(manifest.read_text(encoding="utf-8"))
+    if not isinstance(bank, list) or not 1 <= len(bank) <= 20:
+        raise ValueError(f"{manifest}: expected a list of 1–20 voice presets")
+    for index, item in enumerate(bank):
+        if not isinstance(item, dict):
+            raise ValueError(f"{manifest}: preset {index} must be an object")
+        voice_id = item.get("id")
+        name = item.get("name")
+        register = item.get("register")
+        filename = item.get("file")
+        if not isinstance(voice_id, str) or not voice_id.isidentifier():
+            raise ValueError(f"{manifest}: preset {index} has an invalid id")
+        if voice_id in files:
+            raise ValueError(f"{manifest}: duplicate voice id {voice_id!r}")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"{manifest}: preset {voice_id!r} needs a name")
+        if not isinstance(register, str) or not register.strip():
+            raise ValueError(f"{manifest}: preset {voice_id!r} needs a register")
+        if not isinstance(filename, str) or not filename:
+            raise ValueError(f"{manifest}: preset {voice_id!r} needs a file")
+        candidate = Path(filename)
+        if candidate.is_absolute():
+            raise ValueError(f"{manifest}: preset {voice_id!r} must use a relative file")
+        audio_path = (manifest.parent / candidate).resolve(strict=True)
+        if not audio_path.is_relative_to(manifest.parent) or audio_path.suffix.lower() != ".wav":
+            raise ValueError(f"{manifest}: preset {voice_id!r} must be a WAV inside the bank")
+        files[voice_id] = audio_path
+        states[voice_id] = model.get_state_for_audio_prompt(audio_path, truncate=True)
+        details.append({
+            "id": voice_id,
+            "name": name.strip(),
+            "register": register.strip(),
+            "preview_url": f"voice-presets/{voice_id}/audio",
+        })
+    preset_voice_states = states
+    preset_voice_files = files
+    preset_voice_details = details
+    logger.info("Loaded %d local voice presets from %s", len(bank), manifest)
+
+
+def write_to_queue(
+    queue: Queue[bytes | Exception | None], text_to_generate: str, model_state: ModelState
+):
     """Allows writing to the StreamingResponse as if it were a file."""
 
     class FileLikeToQueue(io.IOBase):
-        def __init__(self, queue: Queue[bytes | None]):
+        def __init__(self, queue: Queue[bytes | Exception | None]):
             self.queue = queue
 
         def write(self, data: bytes):
@@ -101,20 +180,27 @@ def write_to_queue(queue: Queue[bytes | None], text_to_generate: str, model_stat
             pass
 
         def close(self):
-            self.queue.put(None)
+            super().close()
 
-    model = _loaded_model()
-    audio_chunks = model.generate_audio_stream(
-        model_state=model_state, text_to_generate=text_to_generate
-    )
-    # FileLikeToQueue only implements the write/close subset that StreamingWAVWriter uses.
-    stream_audio_chunks(
-        cast(BinaryIO, FileLikeToQueue(queue)), audio_chunks, model.config.mimi.sample_rate
-    )
+    try:
+        with generation_lock:
+            model = _loaded_model()
+            audio_chunks = model.generate_audio_stream(
+                model_state=model_state, text_to_generate=text_to_generate
+            )
+            # FileLikeToQueue only implements the write/close subset that StreamingWAVWriter uses.
+            stream_audio_chunks(
+                cast(BinaryIO, FileLikeToQueue(queue)), audio_chunks, model.config.mimi.sample_rate
+            )
+    except Exception as error:
+        logger.exception("TTS generation failed")
+        queue.put(error)
+    finally:
+        queue.put(None)
 
 
 def generate_data_with_state(text_to_generate: str, model_state: ModelState) -> Iterator[bytes]:
-    queue: Queue[bytes | None] = Queue()
+    queue: Queue[bytes | Exception | None] = Queue()
 
     # Run your function in a thread
     thread = threading.Thread(target=write_to_queue, args=(queue, text_to_generate, model_state))
@@ -122,14 +208,17 @@ def generate_data_with_state(text_to_generate: str, model_state: ModelState) -> 
 
     # Yield data as it becomes available
     i = 0
-    while True:
-        data = queue.get()
-        if data is None:
-            break
-        i += 1
-        yield data
-
-    thread.join()
+    try:
+        while True:
+            data = queue.get()
+            if data is None:
+                break
+            if isinstance(data, Exception):
+                raise data
+            i += 1
+            yield data
+    finally:
+        thread.join()
 
 
 @web_app.post("/tts")
@@ -137,6 +226,7 @@ def text_to_speech(
     text: str = Form(...),
     voice_url: str | None = Form(None),
     voice_wav: UploadFile | None = File(None),
+    voice_preset: str | None = Form(None),
 ) -> StreamingResponse:
     """
     Generate speech from text using the pre-loaded voice prompt or a custom voice.
@@ -149,11 +239,15 @@ def text_to_speech(
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
-    if voice_url is not None and voice_wav is not None:
-        raise HTTPException(status_code=400, detail="Cannot provide both voice_url and voice_wav")
+    if sum(value is not None for value in (voice_url, voice_wav, voice_preset)) > 1:
+        raise HTTPException(status_code=400, detail="Choose one voice URL, upload, or preset")
 
     # Use the appropriate model state
-    if voice_url is not None:
+    if voice_preset is not None:
+        model_state = preset_voice_states.get(voice_preset)
+        if model_state is None:
+            raise HTTPException(status_code=400, detail="Unknown voice preset")
+    elif voice_url is not None:
         if not (
             voice_url.startswith("http://")
             or voice_url.startswith("https://")
@@ -163,7 +257,8 @@ def text_to_speech(
             raise HTTPException(
                 status_code=400, detail="voice_url must start with http://, https://, or hf://"
             )
-        model_state = _loaded_model()._cached_get_state_for_audio_prompt(voice_url)
+        with generation_lock:
+            model_state = _loaded_model()._cached_get_state_for_audio_prompt(voice_url)
         logging.warning("Using voice from URL: %s", voice_url)
     elif voice_wav is not None:
         # Use uploaded voice file - preserve extension for format detection
@@ -176,9 +271,10 @@ def text_to_speech(
 
         # Close the file before reading it back (required on Windows)
         try:
-            model_state = _loaded_model().get_state_for_audio_prompt(
-                Path(temp_file_path), truncate=True
-            )
+            with generation_lock:
+                model_state = _loaded_model().get_state_for_audio_prompt(
+                    Path(temp_file_path), truncate=True
+                )
         finally:
             os.unlink(temp_file_path)
     elif default_voice_state is not None:
@@ -226,6 +322,10 @@ def serve(
             show_default=False,
         ),
     ] = None,
+    voice_presets_manifest: Annotated[
+        str | None,
+        typer.Option(help="Local JSON manifest of WAV voice presets to show in the web UI"),
+    ] = None,
     quantize: Annotated[
         bool, typer.Option(help="Apply int8 quantization to reduce memory usage")
     ] = False,
@@ -239,6 +339,7 @@ def serve(
     # Resolved before serving: a voice that cannot be loaded fails at startup instead of on
     # the first request, which would otherwise pay for the encoding of the audio file.
     default_voice_state = tts_model.get_state_for_audio_prompt(default_voice)
+    load_voice_presets(voice_presets_manifest, tts_model)
 
     uvicorn.run("pocket_tts.main:web_app", host=host, port=port, reload=reload)
 

@@ -3,12 +3,33 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pocket TTS - Streaming</title>
+    <title>DEFAULT_DEMO_TITLE</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
         }
+        .voice-choice {
+            width: 100%;
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 1rem;
+            padding: .65rem .8rem;
+            border: 1px solid #cbd5d8;
+            border-radius: .45rem;
+            background: white;
+            text-align: left;
+            color: #243944;
+        }
+        .voice-choice:hover { border-color: #687e8a; }
+        .voice-choice[aria-pressed="true"] {
+            border-color: #9e4b2b;
+            box-shadow: inset 3px 0 #9e4b2b;
+            background: #fff9f5;
+        }
+        .voice-choice:focus-visible { outline: 2px solid #9e4b2b; outline-offset: 2px; }
+        .voice-choice small { color: #526671; }
         .spinner {
             animation: spin 1s linear infinite;
         }
@@ -20,7 +41,7 @@
 </head>
 <body class="bg-gray-50 min-h-screen">
     <div class="max-w-xl mx-auto p-4 space-y-4">
-        <h1 class="text-xl font-bold text-center">Pocket TTS</h1>
+        <h1 class="text-xl font-bold text-center">DEFAULT_DEMO_TITLE</h1>
         
         <div class="bg-white p-4 rounded-lg shadow">
             <textarea
@@ -31,9 +52,19 @@
             >DEFAULT_TEXT_PROMPT</textarea>
         </div>
 
+        <section id="voice-presets-section" class="bg-white p-4 rounded-lg shadow" hidden>
+            <h2 class="font-semibold text-gray-800">Reference voices</h2>
+            <p class="text-sm text-gray-600 mt-1 mb-3">Choose a voice, then hear its short source clip. The generated speech is new audio.</p>
+            <div id="voice-presets" class="grid gap-2" role="group" aria-label="Reference voice presets"></div>
+            <div class="mt-3">
+                <p id="voice-preview-label" class="text-xs text-gray-600 mb-1"></p>
+                <audio id="voice-preview" controls preload="none" class="w-full" hidden></audio>
+            </div>
+        </section>
+
         <div class="bg-white p-4 rounded-lg shadow">
             <label for="voice-url-input" class="block text-sm font-medium text-gray-700 mb-2">
-                Optional voice URL (leave empty to use default voice):
+                Or use a voice URL (overrides the preset):
             </label>
             <input
                 type="text"
@@ -63,7 +94,7 @@
 
         <div class="bg-white p-4 rounded-lg shadow">
             <label for="voice-wav-input" class="block text-sm font-medium text-gray-700 mb-2">
-                Or upload an audio file for voice cloning:
+                Or upload an audio file (overrides the preset and URL):
             </label>
             <input
                 type="file"
@@ -252,9 +283,49 @@
         const audioSection = document.getElementById('audio-section');
         const audio = document.getElementById('audio');
         const downloadLink = document.getElementById('download-link');
+        const voicePresetSection = document.getElementById('voice-presets-section');
+        const voicePresetList = document.getElementById('voice-presets');
+        const voicePreview = document.getElementById('voice-preview');
+        const voicePreviewLabel = document.getElementById('voice-preview-label');
+        let selectedPreset = null;
+        const basePath = window.location.pathname.replace(/\/+$/, '');
 
         // Event listeners
         generateBtn.addEventListener('click', generateAudio);
+
+        async function loadVoicePresets() {
+            const response = await fetch(`${basePath}/voice-presets`);
+            if (!response.ok) throw new Error(`Could not load voice presets (${response.status})`);
+            const voices = await response.json();
+            if (!Array.isArray(voices)) throw new Error('Voice preset response is invalid');
+            if (!voices.length) return;
+
+            const buttons = [];
+            for (const voice of voices) {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'voice-choice';
+                button.setAttribute('aria-pressed', 'false');
+                const name = document.createElement('strong');
+                name.textContent = voice.name;
+                const register = document.createElement('small');
+                register.textContent = voice.register;
+                button.append(name, register);
+                button.addEventListener('click', () => {
+                    selectedPreset = voice.id;
+                    for (const other of buttons) {
+                        other.setAttribute('aria-pressed', String(other === button));
+                    }
+                    voicePreview.src = `${basePath}/${voice.preview_url}`;
+                    voicePreviewLabel.textContent = `Source clip: ${voice.name}`;
+                    voicePreview.hidden = false;
+                });
+                voicePresetList.append(button);
+                buttons.push(button);
+            }
+            voicePresetSection.hidden = false;
+            buttons[0].click();
+        }
 
         function showStatus(message, isLoading = false) {
             statusText.textContent = message;
@@ -314,9 +385,11 @@
                 } else if (voiceUrl) {
                     // Only use voice URL if no WAV file is uploaded
                     formData.append('voice_url', voiceUrl);
+                } else if (selectedPreset) {
+                    formData.append('voice_preset', selectedPreset);
                 }
 
-                const ttsEndpoint = `${window.location.pathname.replace(/\/+$/, '')}/tts`;
+                const ttsEndpoint = `${basePath}/tts`;
 
                 const response = await fetch(ttsEndpoint, {
                     method: 'POST',
@@ -393,6 +466,10 @@
         // Focus on text input when page loads
         window.addEventListener('load', () => {
             textInput.focus();
+            loadVoicePresets().catch(error => {
+                console.error('Could not load voice presets:', error);
+                showStatus(error.message, false);
+            });
         });
     </script>
 </body>
