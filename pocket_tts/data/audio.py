@@ -87,6 +87,9 @@ class StreamingWAVWriter:
         self.wave_writer.setframerate(sample_rate)
         if not self.is_seekable:
             self.wave_writer.setnframes(1_000_000_000)
+            # Keep cleanup safe even if generation raises before finalize().
+            # The header cannot be patched on an unseekable streaming response.
+            self.wave_writer._patchheader = lambda: None  # ty: ignore[unresolved-attribute]
 
     def write_pcm_data(self, audio_chunk: torch.Tensor):
         """Write PCM data using wave module."""
@@ -124,9 +127,6 @@ class StreamingWAVWriter:
         writer = self._writer
         writer.writeframesraw(bytes(num_silence_samples * 2))
 
-        if not self.is_seekable:
-            # do not update the header for unseekable streams
-            writer._patchheader = lambda: None  # ty: ignore[unresolved-attribute]
         writer.close()
 
 

@@ -273,6 +273,23 @@
         let streamingPlayer = null;
         let currentAudioBlob = null;
 
+        // The streaming WAV has an intentionally oversized length in its header.
+        // Correct it once all PCM bytes have arrived so replay and download have
+        // the actual duration, including for long, multi-chunk generations.
+        async function completedWavBlob(blob) {
+            const bytes = new Uint8Array(await blob.arrayBuffer());
+            if (bytes.length < 44 ||
+                String.fromCharCode(...bytes.slice(0, 4)) !== 'RIFF' ||
+                String.fromCharCode(...bytes.slice(8, 12)) !== 'WAVE' ||
+                String.fromCharCode(...bytes.slice(36, 40)) !== 'data') {
+                throw new Error('The server returned an invalid WAV file');
+            }
+            const view = new DataView(bytes.buffer);
+            view.setUint32(4, bytes.length - 8, true);
+            view.setUint32(40, bytes.length - 44, true);
+            return new Blob([bytes], { type: 'audio/wav' });
+        }
+
         // DOM elements
         const textInput = document.getElementById('text-input');
         const generateBtn = document.getElementById('generate-btn');
@@ -397,7 +414,8 @@
                 });
 
                 if (!response.ok) {
-                    throw new Error(`Server error: ${response.status}`);
+                    const detail = await response.json().catch(() => null);
+                    throw new Error(detail?.detail || `Server error: ${response.status}`);
                 }
 
                 // Clone the response for both streaming and blob collection
@@ -409,25 +427,22 @@
                 streamingPlayer = new StreamingWavPlayer();
 
                 const processStream = async () => {
-                    try {
-                        while (true) {
-                            const { done, value } = await reader.read();
-                            if (done) break;
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
 
-                            if (value) {
-                                streamingPlayer.addChunk(value);
-                            }
+                        if (value) {
+                            streamingPlayer.addChunk(value);
                         }
-                    } catch (e) {
-                        console.error('Error processing stream:', e);
                     }
                 };
 
                 // Start processing the stream
-                processStream();
+                const playbackFinished = processStream();
 
                 // Also collect the full blob for download/audio element
-                const blob = await responseForHistory.blob();
+                const blob = await completedWavBlob(await responseForHistory.blob());
+                await playbackFinished;
                 const totalTime = ((performance.now() - startTime) / 1000).toFixed(2);
                 currentAudioBlob = blob;
 

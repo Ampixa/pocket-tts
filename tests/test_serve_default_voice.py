@@ -21,8 +21,14 @@ class FakeTTSModel:
 
     def __init__(self):
         self.config = SimpleNamespace(mimi=SimpleNamespace(sample_rate=24000))
+        self.flow_lm = SimpleNamespace(
+            conditioner=SimpleNamespace(
+                tokenizer=lambda text: (torch.arange(len(text.split())).unsqueeze(0),)
+            )
+        )
         self.voices_requested: list[Path | str | torch.Tensor] = []
         self.states_used: list[dict[str, Any]] = []
+        self.texts_used: list[str] = []
 
     def get_state_for_audio_prompt(
         self, audio_conditioning: Path | str | torch.Tensor, truncate: bool = False
@@ -39,6 +45,7 @@ class FakeTTSModel:
         self, model_state: dict[str, Any], text_to_generate: str
     ) -> Iterator[torch.Tensor]:
         self.states_used.append(model_state)
+        self.texts_used.append(text_to_generate)
         yield torch.zeros(2400)
 
 
@@ -190,5 +197,50 @@ def test_generation_error_reaches_the_response(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(main, "tts_model", BrokenModel())
     monkeypatch.setattr(main, "default_voice_state", {"voice": "test"})
 
-    with pytest.raises(RuntimeError, match="codec failed"):
+    with pytest.raises(RuntimeError, match="TTS failed on chunk 1/1: codec failed"):
         TestClient(main.web_app).post("/tts", data={"text": "नमस्ते"})
+
+
+def test_later_chunk_error_is_not_silently_accepted(monkeypatch: pytest.MonkeyPatch):
+    class BrokenSecondChunkModel(FakeTTSModel):
+        def generate_audio_stream(
+            self, model_state: dict[str, Any], text_to_generate: str
+        ) -> Iterator[torch.Tensor]:
+            if "Line 3" in text_to_generate:
+                raise RuntimeError("decoder failed")
+            yield from super().generate_audio_stream(model_state, text_to_generate)
+
+    fake_model = BrokenSecondChunkModel()
+    monkeypatch.setattr(main, "tts_model", fake_model)
+    monkeypatch.setattr(main, "default_voice_state", {"voice": "test"})
+
+    with pytest.raises(RuntimeError, match="TTS failed on chunk 2/2: decoder failed"):
+        TestClient(main.web_app).post("/tts", data={
+            "text": "Line 1.\nLine 2.\nLine 3.\nLine 4."
+        })
+    assert fake_model.texts_used == ["Line 1. Line 2."]
+
+
+def test_tts_endpoint_generates_long_text_in_one_stream(monkeypatch: pytest.MonkeyPatch):
+    fake_model = FakeTTSModel()
+    monkeypatch.setattr(main, "tts_model", fake_model)
+    monkeypatch.setattr(main, "default_voice_state", {"voice": "test"})
+    lines = [f"Line {number} is spoken." for number in range(1, 7)]
+
+    response = TestClient(main.web_app).post("/tts", data={"text": "\n".join(lines)})
+
+    assert response.status_code == 200
+    assert fake_model.texts_used == [" ".join(lines[n:n + 2]) for n in (0, 2, 4)]
+    assert response.content.count(b"RIFF") == 1
+    assert response.content.count(b"WAVE") == 1
+
+
+def test_tts_endpoint_rejects_text_too_long_before_stream(monkeypatch: pytest.MonkeyPatch):
+    fake_model = FakeTTSModel()
+    monkeypatch.setattr(main, "tts_model", fake_model)
+    monkeypatch.setattr(main, "default_voice_state", {"voice": "test"})
+
+    response = TestClient(main.web_app).post("/tts", data={"text": "a" * 12_001})
+
+    assert response.status_code == 413
+    assert fake_model.texts_used == []

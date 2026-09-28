@@ -11,6 +11,7 @@ from pathlib import Path
 from queue import Queue
 from typing import Annotated, BinaryIO, cast
 
+import torch
 import typer
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -30,6 +31,7 @@ from pocket_tts.default_parameters import (
 from pocket_tts.models.model_state import export_model_state
 from pocket_tts.models.tts_model import TTSModel
 from pocket_tts.modules.stateful_module import ModelState
+from pocket_tts.serve_chunking import split_demo_text
 from pocket_tts.utils.logging_utils import enable_logging
 from pocket_tts.utils.utils import _ORIGINS_OF_PREDEFINED_VOICES
 
@@ -165,7 +167,7 @@ def load_voice_presets(manifest_path: str | None, model: TTSModel) -> None:
 
 
 def write_to_queue(
-    queue: Queue[bytes | Exception | None], text_to_generate: str, model_state: ModelState
+    queue: Queue[bytes | Exception | None], text_chunks: list[str], model_state: ModelState
 ):
     """Allows writing to the StreamingResponse as if it were a file."""
 
@@ -185,12 +187,23 @@ def write_to_queue(
     try:
         with generation_lock:
             model = _loaded_model()
-            audio_chunks = model.generate_audio_stream(
-                model_state=model_state, text_to_generate=text_to_generate
-            )
+
+            def audio_chunks() -> Iterator[torch.Tensor]:
+                for index, part in enumerate(text_chunks, start=1):
+                    try:
+                        yield from model.generate_audio_stream(
+                            model_state=model_state, text_to_generate=part
+                        )
+                    except Exception as error:
+                        raise RuntimeError(
+                            f"TTS failed on chunk {index}/{len(text_chunks)}: {error}"
+                        ) from error
+                    if index < len(text_chunks):
+                        yield torch.zeros(int(model.config.mimi.sample_rate * 0.16))
+
             # FileLikeToQueue only implements the write/close subset that StreamingWAVWriter uses.
             stream_audio_chunks(
-                cast(BinaryIO, FileLikeToQueue(queue)), audio_chunks, model.config.mimi.sample_rate
+                cast(BinaryIO, FileLikeToQueue(queue)), audio_chunks(), model.config.mimi.sample_rate
             )
     except Exception as error:
         logger.exception("TTS generation failed")
@@ -199,15 +212,14 @@ def write_to_queue(
         queue.put(None)
 
 
-def generate_data_with_state(text_to_generate: str, model_state: ModelState) -> Iterator[bytes]:
+def generate_data_with_state(text_chunks: list[str], model_state: ModelState) -> Iterator[bytes]:
     queue: Queue[bytes | Exception | None] = Queue()
 
     # Run your function in a thread
-    thread = threading.Thread(target=write_to_queue, args=(queue, text_to_generate, model_state))
+    thread = threading.Thread(target=write_to_queue, args=(queue, text_chunks, model_state))
     thread.start()
 
     # Yield data as it becomes available
-    i = 0
     try:
         while True:
             data = queue.get()
@@ -215,7 +227,6 @@ def generate_data_with_state(text_to_generate: str, model_state: ModelState) -> 
                 break
             if isinstance(data, Exception):
                 raise data
-            i += 1
             yield data
     finally:
         thread.join()
@@ -238,6 +249,13 @@ def text_to_speech(
     """
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    tokenizer = _loaded_model().flow_lm.conditioner.tokenizer
+    try:
+        text_chunks = split_demo_text(text, lambda part: len(tokenizer(part)[0]))
+    except ValueError as error:
+        raise HTTPException(status_code=413, detail=str(error)) from error
+    logger.info("Generating %d text chunks", len(text_chunks))
 
     if sum(value is not None for value in (voice_url, voice_wav, voice_preset)) > 1:
         raise HTTPException(status_code=400, detail="Choose one voice URL, upload, or preset")
@@ -283,7 +301,7 @@ def text_to_speech(
         raise HTTPException(status_code=500, detail="The server has no default voice loaded.")
 
     return StreamingResponse(
-        generate_data_with_state(text, model_state),
+        generate_data_with_state(text_chunks, model_state),
         media_type="audio/wav",
         headers={
             "Content-Disposition": "attachment; filename=generated_speech.wav",
