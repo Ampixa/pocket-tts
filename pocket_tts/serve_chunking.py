@@ -3,7 +3,11 @@
 import re
 from collections.abc import Callable
 
-MAX_DEMO_TOKENS = 18
+# The model's own short-text limit is 50 tokens. A smaller server-only limit
+# split ordinary Nepali sentences into one-word fragments and caused repeated
+# end-of-utterance pauses. Leave room below the model limit while keeping
+# complete short paragraphs together.
+MAX_DEMO_TOKENS = 40
 MAX_DEMO_CHUNKS = 80
 MAX_DEMO_CHARACTERS = 12_000
 
