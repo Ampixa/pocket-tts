@@ -37,3 +37,6 @@ class Batch:
     # Cold-encoded stitch latents from the precompute, [B, S, C]. When set, the
     # stitch is not re-encoded from `audio` and no waveform is needed at all.
     stitch_latents: torch.Tensor | None = None
+    # Per-row stitched targets, padded to [B, T, C]. This keeps the exact cut
+    # boundary when stores calibrated with different stitch lengths are mixed.
+    precomputed_latents: torch.Tensor | None = None

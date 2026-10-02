@@ -311,10 +311,12 @@ class DataLoader:
             word_index = int(words[k])
             text = " ".join(w["word"] for w in entry.words[word_index:])
             stitch = stitches[k]
-            assert stitch.shape[0] == S, (
-                f"{entry.latents_file}: stored stitch has {stitch.shape[0]} frames, "
-                f"meta says {S}"
-            )
+            if stitch.ndim != 2 or stitch.shape[0] <= 0 or stitch.shape[1] != lat.shape[1]:
+                raise ValueError(f"{entry.latents_file}: invalid stored stitch shape {tuple(stitch.shape)}")
+            # The calibration may be 35 frames for one source and 36 for
+            # another even with identical Mimi weights. Preserve each row's
+            # exact cold window instead of assuming the manifest-level value.
+            S = stitch.shape[0]
         tokens = torch.tensor(self.tokenize(text), dtype=torch.long)
         target_frames = self._latent_target_frames(entry, cut_frames, stored)
         stitch_frames = min(S, target_frames)
@@ -361,12 +363,18 @@ class DataLoader:
         stitches, tokens, prompts, tails, target_frames = zip(*batch, strict=True)
         num_prompt_frames = torch.tensor([max(1, p.shape[0]) for p in prompts], dtype=torch.long)
         if self.stored_stitches:
-            # Every stored stitch is exactly S frames, so they stack without
-            # padding, and there is no audio to collate.
-            stitch_latents = torch.stack([s for s in stitches])
+            # Stitch lengths may differ by source. Assemble each target before
+            # padding, so a shorter stitch never inserts a zero frame ahead
+            # of its warm tail. No waveform or Mimi encode is needed.
+            targets = tuple(torch.cat([stitch[:frames], tail], dim=0)
+                            for stitch, tail, frames in zip(stitches, tails, target_frames, strict=True))
+            for target, frames in zip(targets, target_frames, strict=True):
+                if target.shape[0] != frames:
+                    raise ValueError(f"stitched target has {target.shape[0]} frames, expected {frames}")
+            precomputed_latents = self._pad_latents(targets, 0)
             audio = torch.zeros(len(stitches), 1, 0)
         else:
-            stitch_latents = None
+            precomputed_latents = None
             audio = self._collate_stitch_audio(stitches)
         return Batch(
             audio,
@@ -374,9 +382,9 @@ class DataLoader:
             list(tokens),
             torch.zeros(len(stitches), 1, 0),
             num_prompt_frames,
-            tail_latents=self._pad_latents(tails, 0),
+            tail_latents=None if self.stored_stitches else self._pad_latents(tails, 0),
             prompt_latents=self._pad_latents(prompts, 1),
-            stitch_latents=stitch_latents,
+            precomputed_latents=precomputed_latents,
         )
 
     def get_entry(self, index: int) -> Entry:
