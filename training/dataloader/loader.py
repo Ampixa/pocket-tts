@@ -11,7 +11,7 @@ import logging
 import queue
 import random
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -28,28 +28,60 @@ from .types import Batch, Entry
 logger = logging.getLogger(__name__)
 
 
-def _prefetch(iterator: Iterator[Batch], depth: int = 4) -> Iterator[Batch]:
+def _prefetch(iterator: Iterator[Batch], depth: int = 4) -> Generator[Batch, None, None]:
     """Run the (synchronous, IO-bound) loader in a background thread."""
     q: queue.Queue[Batch | Exception | None] = queue.Queue(maxsize=depth)
+    stopped = threading.Event()
+
+    def publish(item: Batch | Exception | None) -> bool:
+        # The consumer may close after a bounded validation pass. Never leave
+        # the producer blocked forever on a full queue in that case.
+        while not stopped.is_set():
+            try:
+                q.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def worker():
         try:
             for item in iterator:
-                q.put(item)
+                if not publish(item):
+                    break
         except Exception as error:
             logger.exception("data loader prefetch failed")
-            q.put(error)
+            publish(error)
         finally:
-            q.put(None)
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception as error:
+                    logger.exception("data loader close failed")
+                    publish(error)
+            publish(None)
 
-    threading.Thread(target=worker, daemon=True).start()
-    while True:
-        item = q.get()
-        if item is None:
-            return
-        if isinstance(item, Exception):
-            raise RuntimeError("data loader prefetch failed") from item
-        yield item
+    thread = threading.Thread(target=worker, name="tts-data-prefetch", daemon=True)
+    thread.start()
+    try:
+        while True:
+            try:
+                item = q.get(timeout=5)
+            except queue.Empty:
+                if not thread.is_alive():
+                    raise RuntimeError("data loader prefetch worker exited without a result")
+                continue
+            if item is None:
+                return
+            if isinstance(item, Exception):
+                raise RuntimeError("data loader prefetch failed") from item  # noqa: TRY004
+            yield item
+    finally:
+        stopped.set()
+        thread.join(timeout=5)
+        if thread.is_alive():
+            logger.warning("data loader prefetch worker did not stop within 5 seconds")
 
 
 MIN_CUT_SEC = 1.0  # keep at least this much audio on both sides of a cut
@@ -404,7 +436,7 @@ class DataLoader:
         except Exception as error:
             raise RuntimeError(f"{self.jsonl}: failed to load {entry.path}: {error}") from error
 
-    def __iter__(self) -> Iterator[Batch]:
+    def __iter__(self) -> Generator[Batch, None, None]:  # noqa: PYI058 -- validation closes it
         # Batches are produced in a background thread (the loader is IO-bound)
         # so the GPU never waits on network storage.
         return _prefetch(self._batches())
@@ -415,6 +447,12 @@ class DataLoader:
         # concurrently keeps the GPUs fed. sphn releases the GIL, so threads are
         # enough. Without this a cold, wide corpus starves training (~2x).
         pool = ThreadPoolExecutor(max_workers=self.io_workers)
+        try:
+            yield from self._batches_with_pool(pool)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _batches_with_pool(self, pool: ThreadPoolExecutor) -> Iterator[Batch]:
         if len(self.entries) < self.batch_size:
             raise ValueError(
                 f"{len(self.entries)} usable entries for this rank but batch_size="

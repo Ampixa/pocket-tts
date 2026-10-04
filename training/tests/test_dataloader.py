@@ -1,6 +1,8 @@
 """Dataloader behaviour that silently degrades training when it breaks."""
 
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +70,26 @@ def test_batches_have_the_requested_size(tmp_path: Path):
     batch = next(iter(_loader(_manifest(tmp_path, n=8), batch_size=4)))
     assert batch.audio.shape[0] == 4
     assert len(batch.text_tokens) == 4
+
+
+def test_bounded_loader_releases_prefetch_and_io_threads(tmp_path: Path):
+    loader = _loader(_manifest(tmp_path, n=8), io_workers=2)
+    for _ in range(3):
+        batches = iter(loader)
+        assert next(batches).audio.shape[0] == 2
+        batches.close()
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        leaked = [
+            thread.name
+            for thread in threading.enumerate()
+            if thread.name == "tts-data-prefetch" or thread.name.startswith("ThreadPoolExecutor")
+        ]
+        if not leaked:
+            break
+        time.sleep(0.05)
+    assert not leaked, f"loader threads remained after close: {leaked}"
 
 
 def test_target_audio_never_exceeds_max_duration(tmp_path: Path):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -22,11 +23,28 @@ def test_prefetch_propagates_worker_exception() -> None:
     assert isinstance(error.value.__cause__, ValueError)
 
 
+def test_prefetch_close_releases_infinite_source() -> None:
+    source_closed = threading.Event()
+
+    def infinite():
+        try:
+            while True:
+                yield 1
+        finally:
+            source_closed.set()
+
+    batches = _prefetch(infinite(), depth=1)
+    assert next(batches) == 1
+    batches.close()
+    assert source_closed.wait(timeout=2), "prefetch producer stayed blocked after close"
+    assert not any(t.name == "tts-data-prefetch" and t.is_alive() for t in threading.enumerate())
+
+
 def test_unreadable_sample_is_not_skipped() -> None:
     loader = object.__new__(DataLoader)
     loader.jsonl = "train.jsonl"
 
-    def fail(_entry):
+    def fail(_entry: object):
         raise FileNotFoundError("missing wav")
 
     loader._sample = fail

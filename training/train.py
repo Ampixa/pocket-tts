@@ -30,12 +30,12 @@ from training.args import TrainArgs, dump_args, load_args, save_args
 from training.checkpointing import EMA, latest_checkpoint, load_checkpoint, save_checkpoint
 from training.dataloader import DataLoader, SubprocessDataLoader, encode_batch
 from training.distributed import (
-    place_mimi,
     avg_across_ranks,
     get_rank,
     get_world_size,
     init_distributed,
     is_torchrun,
+    place_mimi,
     shutdown_distributed,
 )
 from training.modules.builders import build_models
@@ -384,26 +384,29 @@ def validate(
     autocast = make_autocast(device)
     totals: dict[str, float] = {}
     n = 0
-    for _ in range(args.num_valid_batches):
-        try:
-            batch = next(loader)
-        except StopIteration:
-            break
-        latents, mask, voice_prompt_latents, num_voice_prompt_frames = encode_batch(
-            mimi, batch, device
-        )
-        with autocast:
-            _, metrics = model(
-                latents,
-                mask,
-                batch.text_tokens,
-                voice_prompt_latents,
-                num_voice_prompt_frames=num_voice_prompt_frames,
+    try:
+        for _ in range(args.num_valid_batches):
+            try:
+                batch = next(loader)
+            except StopIteration:
+                break
+            latents, mask, voice_prompt_latents, num_voice_prompt_frames = encode_batch(
+                mimi, batch, device
             )
-        for k, v in metrics.items():
-            if v.numel() == 1:
-                totals[k] = totals.get(k, 0.0) + v.item()
-        n += 1
+            with autocast:
+                _, metrics = model(
+                    latents,
+                    mask,
+                    batch.text_tokens,
+                    voice_prompt_latents,
+                    num_voice_prompt_frames=num_voice_prompt_frames,
+                )
+            for k, v in metrics.items():
+                if v.numel() == 1:
+                    totals[k] = totals.get(k, 0.0) + v.item()
+            n += 1
+    finally:
+        loader.close()
     averaged = {k: avg_across_ranks(v / max(1, n)) for k, v in totals.items()}
     if rank == 0:
         shown = {k: f"{v:.4f}" for k, v in averaged.items()}
